@@ -49,7 +49,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
         if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
             model.eval()
-            lm_checkpoint(lm_config, model=model, prefix="sft", optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb)
+            lm_checkpoint(model.config, model=model, prefix="sft", optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb)
             model.train()
         del input_ids, labels, res, loss
 
@@ -64,7 +64,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_seq_len", type=int, default=340, help="训练的最大截断长度（中文1token≈1.5~1.7字符）")
     parser.add_argument("--use_moe", type=int, default=0, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
     parser.add_argument("--epochs", type=int, default=2, help="训练轮数")
-    parser.add_argument("--batch_size", type=int, default=16, help="每批次训练样本数量")
+    parser.add_argument("--batch_size", type=int, default=64, help="每批次训练样本数量")
     parser.add_argument("--learning_rate", type=float, default=1e-6, help="初始学习率")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
@@ -74,8 +74,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
     parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔")
     parser.add_argument("--use_wandb", action="store_true", default=True, help="是否使用wandb")
-    parser.add_argument("--wandb_project", type=str, default="MiniGPT-SFT", help="wandb项目名")
-    parser.add_argument("--use_compile", action="store_true", default=False, help="是否使用torch.compile加速")
+    parser.add_argument("--wandb_project", type=str, default="MiniGPT", help="wandb项目名")
     args = parser.parse_args()
 
     # ========== 1. 初始化环境和随机种子 ==========
@@ -83,49 +82,48 @@ if __name__ == "__main__":
     if torch.distributed.is_initialized(): args.device = f"cuda:{local_rank}"
     setup_seed(42 + (torch.distributed.get_rank() if torch.distributed.is_initialized() else 0))
     
-    # ========== 2. 配置模型参数、检查ckp ==========
-    lm_config = MiniGPTConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
-    ckp_data = lm_checkpoint(lm_config) if args.from_resume else None
-    
+    # ========== 2. 定义模型、检查ckp ==========
+    model = MiniGPTForCausalLM(MiniGPTConfig(hidden_size=args.hidden_size, 
+        num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe)))
+    get_model_params(model, model.config)
+    ckp_data = lm_checkpoint(model.config) if args.from_resume else None
+    if not ckp_data:
+        ckp_data = torch.load(args.from_weight, map_location=args.device)
+        model.load_state_dict(ckp_data["model"], strict=False)
+        ckp_data = None
+        Logger(f"Load model weights from {args.from_weight}")
+
     # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
+
+    # ========== 4. 定义数据和优化器 ==========
+    tokenizer = AutoTokenizer.from_pretrained("../model")
+    train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    train_sampler = DistributedSampler(train_ds) if torch.distributed.is_initialized() else None
+    scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == "float16"))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+
+    # ========== 5. 从ckp恢复状态 ==========
+    start_epoch, start_step = 0, 0
+    if args.from_resume and ckp_data:
+        model.load_state_dict(ckp_data["model"])
+        scaler.load_state_dict(ckp_data["scaler"])
+        optimizer.load_state_dict(ckp_data["optimizer"])
+        start_epoch = ckp_data["epoch"]
+        start_step = ckp_data.get("step", 0)
+    model.to(args.device)
     
-    # ========== 4. 配置wandb ==========
+    # ========== 6. 配置wandb ==========
     wandb = None
     if args.use_wandb and is_main_process():
         import swanlab as wandb
         wandb_id = ckp_data.get("wandb_id") if ckp_data else None
         resume = "must" if wandb_id else None
-        wandb_run_name = f"MiniGPT-SFT-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
+        wandb_run_name = f"sft_epoch_{args.epochs}_bs_{args.batch_size}_lr_{args.learning_rate}"
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
-    
-    # ========== 5. 定义模型、数据、优化器 ==========
-    tokenizer = AutoTokenizer.from_pretrained("../model")
-    model = MiniGPTForCausalLM(lm_config)
-    get_model_params(model, lm_config)
-    model.to(device_type)
-    if args.use_compile:
-        model = torch.compile(model)
-        Logger("Enable torch.compile to speedup training")
-    train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
-    train_sampler = DistributedSampler(train_ds) if torch.distributed.is_initialized() else None
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == "float16"))
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
-    
-    # ========== 6. 从ckp恢复状态 ==========
-    if not ckp_data:
-        ckp_data = torch.load(args.from_weight, map_location=args.device)
-        ckp_data["epoch"] = 0
-        ckp_data["step"] = 0
-        Logger(f"Load model weights from {args.from_weight}")
-    model.load_state_dict(ckp_data["model"])
-    optimizer.load_state_dict(ckp_data["optimizer"])
-    scaler.load_state_dict(ckp_data["scaler"])
-    start_epoch = ckp_data["epoch"]
-    start_step = ckp_data.get("step", 0)
-    
+
     # ========== 7. DDP包模型 ==========
     if torch.distributed.is_initialized():
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}

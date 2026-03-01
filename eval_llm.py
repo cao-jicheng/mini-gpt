@@ -4,13 +4,14 @@ import argparse
 import warnings
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
-from model import MiniGPTConfig, MiniGPTForCausalLM
+from model import MiniGPTConfig, MiniGPTForCausalLM, apply_lora, load_lora
 from trainer.utils import setup_seed, get_model_params
 
 warnings.filterwarnings('ignore')
 
 def init_model(args):
     tokenizer = AutoTokenizer.from_pretrained("./model")
+    assert os.path.exists(args.model_path), "模型权重文件不存在"
     _, ckp_name = os.path.split(args.model_path)
     if ckp_name.endswith(".pth"):
         items = ckp_name[:-4].split("_")
@@ -27,6 +28,10 @@ def init_model(args):
         # 模型结构中embed_tokens和lm_head共享权重，因此命名参数比权重名称少一个
         assert len(ckp_weights.keys()) == len(model_weights) + 1, "权重文件与模型结构不匹配"
         model.load_state_dict(ckp_weights, strict=True)
+        # 加载LoRA权重
+        if os.path.exists(args.lora_path):
+            apply_lora(model)
+            load_lora(model, args.lora_path)
     else:
         ckp_name = "unknown"
         model = AutoModelForCausalLM.from_pretrained(args.model_path, trust_remote_code=True)
@@ -34,14 +39,15 @@ def init_model(args):
 
 def main():
     parser = argparse.ArgumentParser(description="MiniGPT模型推理与对话")
-    parser.add_argument("--model_path", default="./checkpoints", type=str, help="模型加载路径")
-    parser.add_argument("--rope_scaling", default=False, action="store_true", help="启用RoPE位置编码外推")
-    parser.add_argument("--max_new_tokens", default=8192, type=int, help="最大生成长度（注意：并非模型实际长文本能力）")
-    parser.add_argument("--temperature", default=0.85, type=float, help="生成温度，控制随机性（0-1，越大越随机）")
-    parser.add_argument("--top_p", default=0.85, type=float, help="nucleus采样阈值（0-1）")
-    parser.add_argument("--historys", default=0, type=int, help="携带历史对话轮数（0表示不携带历史）")
-    parser.add_argument("--show_speed", default=False, action="store_true", help="显示decode速度（tokens/s）")
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", type=str, help="运行设备")
+    parser.add_argument("--model_path", type=str, default="none", help="模型权重加载路径")
+    parser.add_argument("--lora_path", type=str, default="none", help="LoRA权重加载路径")
+    parser.add_argument("--rope_scaling", action="store_true", default=False,  help="启用RoPE位置编码外推")
+    parser.add_argument("--max_new_tokens", type=int, default=8192, help="最大生成长度（注意：并非模型实际长文本能力）")
+    parser.add_argument("--temperature", type=float, default=0.85, help="生成温度，控制随机性（0-1，越大越随机）")
+    parser.add_argument("--top_p", type=float, default=0.85, help="nucleus采样阈值（0-1）")
+    parser.add_argument("--historys", type=int, default=0, help="携带历史对话轮数（0表示不携带历史）")
+    parser.add_argument("--show_speed", action="store_true", default=False, help="显示decode速度（tokens/s）")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="运行设备")
     args = parser.parse_args()
     
     prompts = [

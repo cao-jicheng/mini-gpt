@@ -7,14 +7,14 @@ from contextlib import nullcontext
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoTokenizer
-from model import MiniGPTConfig, MiniGPTForCausalLM
-from dataset import PretrainDataset
+from model import MiniGPTConfig, MiniGPTForCausalLM, apply_lora, save_lora
+from dataset import SFTDataset
 from utils import (get_model_params, get_lr, is_main_process, lm_checkpoint, 
     init_distributed_mode, setup_seed, Logger, SkipBatchSampler)
 
 warnings.filterwarnings("ignore")
 
-def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
+def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
     start_time = time.time()
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
         input_ids = input_ids.to(args.device)
@@ -31,7 +31,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
         if (step + 1) % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            torch.nn.utils.clip_grad_norm_(lora_params, args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
@@ -49,29 +49,33 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
         if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
             model.eval()
-            lm_checkpoint(model.config, model=model, prefix="pretrain", optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb)
+            _, lora_name = os.path.split(args.data_path)
+            lora_path = f"../checkpoints/lora/{lora_name[:-6]}.pth"
+            save_lora(model, lora_path)
+            lm_checkpoint(model.config, model=model, prefix="lora", optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb)
             model.train()
         del input_ids, labels, res, loss
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="MiniGPT Pretraining")
-    parser.add_argument("--data_path", type=str, default="../dataset/pretrain_hq.jsonl", help="预训练数据路径")
+    parser = argparse.ArgumentParser(description="MiniGPT LoRA")
+    parser.add_argument("--data_path", type=str, default="../dataset/lora_medical.jsonl", help="LoRA微调数据集路径")
+    parser.add_argument("--from_weight", type=str, default="../checkpoints/sft_768_16.pth",  help="基于某个权重微调")
     parser.add_argument("--from_resume", action="store_true", default=False, help="是否从检查点续训")
     parser.add_argument("--hidden_size", type=int, default=768, help="隐藏层维度")
     parser.add_argument("--num_hidden_layers", type=int, default=16, help="隐藏层数量")
     parser.add_argument("--max_seq_len", type=int, default=340, help="训练的最大截断长度（中文1token≈1.5~1.7字符）")
-    parser.add_argument("--use_moe", type=int, choices=[0, 1], default=0, help="是否使用MoE架构（0=否，1=是）")
-    parser.add_argument("--epochs", type=int, default=1, help="训练轮数（建议1轮zero或2-6轮充分训练）")
-    parser.add_argument("--batch_size", type=int, default=64, help="每批次训练样本数量")
-    parser.add_argument("--learning_rate", type=float, default=5e-4, help="初始学习率")
+    parser.add_argument("--use_moe", type=int, default=0, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
+    parser.add_argument("--epochs", type=int, default=20, help="训练轮数")
+    parser.add_argument("--batch_size", type=int, default=32, help="每批次训练样本数量")
+    parser.add_argument("--learning_rate", type=float, default=1e-4, help="初始学习率")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
     parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")
-    parser.add_argument("--accumulation_steps", type=int, default=8, help="梯度累积步数")
+    parser.add_argument("--accumulation_steps", type=int, default=1, help="梯度累积步数")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
-    parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔")
+    parser.add_argument("--log_interval", type=int, default=10, help="日志打印间隔")
     parser.add_argument("--use_wandb", action="store_true", default=True, help="是否使用wandb")
     parser.add_argument("--wandb_project", type=str, default="MiniGPT", help="wandb项目名")
     args = parser.parse_args()
@@ -81,49 +85,69 @@ if __name__ == "__main__":
     if torch.distributed.is_initialized(): args.device = f"cuda:{local_rank}"
     setup_seed(42 + (torch.distributed.get_rank() if torch.distributed.is_initialized() else 0))
     
-    # ========== 2. 定义模型 ==========
+    # ========== 2. 定义模型、检查ckp ==========
     model = MiniGPTForCausalLM(MiniGPTConfig(hidden_size=args.hidden_size, 
         num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe)))
-    get_model_params(model, model.config)
+    ckp_data = lm_checkpoint(model.config) if args.from_resume else None
+    if not ckp_data:
+        ckp_data = torch.load(args.from_weight, map_location=args.device)
+        model.load_state_dict(ckp_data["model"])
+        ckp_data = None
+        Logger(f"Load model weights from {args.from_weight}")
 
-    # ========== 3. 设置混合精度 ==========
+    # ========== 3. 应用LoRA、冻结非LoRA参数 ==========
+    apply_lora(model)
+    num_total_params = sum(p.numel() for p in model.parameters())
+    num_lora_params = sum(p.numel() for name, p in model.named_parameters() if "lora" in name)
+    Logger(f"Total Params: {num_total_params / 1e6:.3f} M")
+    Logger(f"LoRA Params: {num_lora_params / 1e6:.3f} M")
+    Logger(f"LoRA Ratio: {num_lora_params / num_total_params * 100:.2f}%")
+
+    lora_params = []
+    for name, param in model.named_parameters():
+        if "lora" in name:
+            param.requires_grad = True
+            lora_params.append(param)
+        else:
+            param.requires_grad = False
+
+    # ========== 4. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
 
-    # ========== 4. 定义数据和优化器 ==========
+    # ========== 5. 定义数据和优化器 ==========
     tokenizer = AutoTokenizer.from_pretrained("../model")
-    train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if torch.distributed.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == "float16"))
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+    optimizer = torch.optim.AdamW(lora_params, lr=args.learning_rate)
 
-    # ========== 5. 从ckp恢复状态 ==========
+    # ========== 6. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0
-    ckp_data = lm_checkpoint(model.config) if args.from_resume else None
-    if ckp_data:
+    if args.from_resume and ckp_data:
         model.load_state_dict(ckp_data["model"])
         scaler.load_state_dict(ckp_data["scaler"])
         optimizer.load_state_dict(ckp_data["optimizer"])
         start_epoch = ckp_data["epoch"]
         start_step = ckp_data.get("step", 0)
     model.to(args.device)
-
-    # ========== 6. 配置wandb ==========
+    
+    # ========== 7. 配置wandb ==========
     wandb = None
     if args.use_wandb and is_main_process():
         import swanlab as wandb
         wandb_id = ckp_data.get("wandb_id") if ckp_data else None
         resume = "must" if wandb_id else None
-        wandb_run_name = f"pretrain_epoch_{args.epochs}_bs_{args.batch_size}_lr_{args.learning_rate}"
+        wandb_run_name = f"lora_epoch_{args.epochs}_bs_{args.batch_size}_lr_{args.learning_rate}"
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
 
-    # ========== 7. DDP包模型 ==========
+    # ========== 8. DDP包模型 ==========
     if torch.distributed.is_initialized():
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         model = DistributedDataParallel(model, device_ids=[local_rank])
     
-    # ========== 8. 开始训练 ==========
+    # ========== 9. 开始训练 ==========
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
         setup_seed(42 + epoch)
@@ -133,10 +157,10 @@ if __name__ == "__main__":
         loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
         if skip > 0:
             Logger(f"Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始")
-            train_epoch(epoch, loader, len(loader) + skip, start_step, wandb)
+            train_epoch(epoch, loader, len(loader) + skip, lora_params, start_step, wandb)
         else:
-            train_epoch(epoch, loader, len(loader), 0, wandb)
+            train_epoch(epoch, loader, len(loader), lora_params, 0, wandb)
     
-    # ========== 9. 清理分布进程 ==========
+    # ========== 10. 清理分布进程 ==========
     if torch.distributed.is_initialized(): 
         torch.distributed.destroy_process_group()

@@ -13,6 +13,7 @@ def init_model(args):
     tokenizer = AutoTokenizer.from_pretrained("./model")
     assert os.path.exists(args.model_path), "模型权重文件不存在"
     _, ckp_name = os.path.split(args.model_path)
+    print(f"加载模型权重文件: {args.model_path}")
     if ckp_name.endswith(".pth"):
         items = ckp_name[:-4].split("_")
         num_hidden_layers = int(items[2])
@@ -30,6 +31,7 @@ def init_model(args):
         model.load_state_dict(ckp_weights, strict=True)
         # 加载LoRA权重
         if os.path.exists(args.lora_path):
+            print(f"加载LoRA权重文件: {args.lora_path}")
             apply_lora(model)
             load_lora(model, args.lora_path)
     else:
@@ -61,12 +63,14 @@ def main():
         "推荐一些中国的美食"
     ]
     
-    conversation = []
+    print("----------------------------")
+    print("|   MiniGPT模型推理与对话   |")
+    print("----------------------------")
     model, tokenizer, ckp_name = init_model(args)
-    print(f"MiniGPT模型: {ckp_name}")
-    input_mode = int(input("[0] 自动测试\n[1] 手动输入\n"))
+    input_mode = int(input("[0] 自动测试\n[1] 手动输入\n请选择："))
     streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
     prompt_iter = prompts if input_mode == 0 else iter(lambda: input("== 🤶 ==: "), '')
+    conversation = []
     for prompt in prompt_iter:
         setup_seed(2026)
         if input_mode == 0: 
@@ -87,7 +91,7 @@ def main():
         response = tokenizer.decode(generated_ids[0][len(inputs["input_ids"][0]):], skip_special_tokens=True)
         conversation.append({"role": "assistant", "content": response})
         gen_tokens = len(generated_ids[0]) - len(inputs["input_ids"][0])
-        print(f"== 🚀 ==: [Speed] {gen_tokens / (time.time() - st):.2f} tokens/s\n\n") if args.show_speed else print("\n\n")
+        print(f"== 🚀 ==: [Speed] {gen_tokens / (time.time() - st):.2f} tokens/s\n") if args.show_speed else print("\n")
 
 if __name__ == "__main__":
     main()

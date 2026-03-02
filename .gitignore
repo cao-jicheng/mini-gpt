@@ -14,6 +14,7 @@ wheels/
 
 # Model weights
 checkpoints/
+reward_model/
 
 # Wandb
 swanlog/

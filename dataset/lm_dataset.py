@@ -59,12 +59,12 @@ class SFTDataset(Dataset):
     数据格式：
     {"conversations": [
         {"role": "user", "content": "请告诉我在中国古代的“四大发明”是什么？"},
-        {"role": "assistant", "content": "中国古代的“四大发明”是指造纸术、印刷术、火药和指南针..."}
-    ]}
+        {"role": "assistant", "content": "中国古代的“四大发明”是指造纸术、印刷术、火药和指南针..."}]
+    }
     {"conversations": [
         {"role": "user", "content": "请描述一下北京的春天。"},
-        {"role": "assistant", "content": "北京的春天是一年四季中最令人期待的季节之一..."}
-    ]}
+        {"role": "assistant", "content": "北京的春天是一年四季中最令人期待的季节之一..."}]
+    }
     """
     def __init__(self, jsonl_path, tokenizer, max_length=1024):
         super().__init__()
@@ -116,6 +116,16 @@ class SFTDataset(Dataset):
         return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
 
 class DPODataset(Dataset):
+    """RLHF强化学习数据集
+    数据格式：
+    {"chosen": [
+        {"role": "user", "content": "Find the size of angle x in the figure."}, 
+        {"role": "assistant", "content": "To determine the size of angle x in the provided figure..."}],
+    "rejected": [
+        {"role": "user", "content": "Find the size of angle x in the figure."}, 
+        {"role": "assistant", "content": "To find the size of angle x, let us apply the basic geometry..."}]
+    }
+    """
     def __init__(self, file_path, tokenizer, max_length=4096):
         super().__init__()
         self.tokenizer = tokenizer
@@ -184,6 +194,17 @@ class DPODataset(Dataset):
         return loss_mask
 
 class RLAIFDataset(Dataset):
+    """RLAIF强化学习数据集
+    数据格式：
+    {"conversations": [
+        {"role": "user", "content": "列出五个基本的人格理论，并分别以一句话概括。"}, 
+        {"role": "assistant", "content": "空"}]
+    }
+    {"conversations": [
+        {"role": "user", "content": "仔细阅读以下句子并回答“汤姆是医生还是建筑工人?”"}, 
+        {"role": "assistant", "content": "空"}]
+    }
+    """
     def __init__(self, jsonl_path, tokenizer, max_length=1024):
         super().__init__()
         self.tokenizer = tokenizer

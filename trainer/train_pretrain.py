@@ -56,7 +56,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniGPT Pretraining")
-    parser.add_argument("--data_path", type=str, default="../dataset/pretrain_hq.jsonl", help="预训练数据路径")
+    parser.add_argument("--data_path", type=str, default="../dataset/pretrain_hq.jsonl", help="预训练数据集")
     parser.add_argument("--from_resume", action="store_true", default=False, help="是否从检查点续训")
     parser.add_argument("--hidden_size", type=int, default=768, help="隐藏层维度")
     parser.add_argument("--num_hidden_layers", type=int, default=16, help="隐藏层数量")

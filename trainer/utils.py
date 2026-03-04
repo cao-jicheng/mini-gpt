@@ -48,7 +48,7 @@ def setup_seed(seed: int):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def lm_checkpoint(config, model=None, optimizer=None, epoch=0, step=0, wandb=None, prefix="none", save_dir="../checkpoints", **kwargs):
+def lm_checkpoint(config, model=None, optimizer=None, epoch=0, step=0, wandb=None, prefix="none", save_dir="../checkpoints", device="cpu", **kwargs):
     os.makedirs(save_dir, exist_ok=True)
     moe_suffix = "_moe" if config.use_moe else ''
     ckp_path = f"{save_dir}/{prefix}_{config.hidden_size}_{config.num_hidden_layers}{moe_suffix}.pth"
@@ -89,7 +89,7 @@ def lm_checkpoint(config, model=None, optimizer=None, epoch=0, step=0, wandb=Non
     # 加载模型checkpoint参数
     else:
         if os.path.exists(ckp_path):
-            ckp_data = torch.load(ckp_path, map_location="cpu")
+            ckp_data = torch.load(ckp_path, map_location=device)
             saved_ws = ckp_data.get("world_size", 1)
             current_ws = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
             if saved_ws != current_ws:

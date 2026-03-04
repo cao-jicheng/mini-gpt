@@ -105,11 +105,16 @@ if __name__ == "__main__":
 
     # ========== 5. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0
-    ckp_data = lm_checkpoint(model.config) if args.from_resume else None
+    ckp_data = lm_checkpoint(model.config, prefix="pretrain", device=args.device) if args.from_resume else None
     if args.from_resume and ckp_data:
         model.load_state_dict(ckp_data["model"])
         scaler.load_state_dict(ckp_data["scaler"])
         optimizer.load_state_dict(ckp_data["optimizer"])
+        # 需要手动切换optimizer中tensor的训练设备
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if torch.is_tensor(v):
+                    state[k] = v.to(args.device)
         start_epoch = ckp_data["epoch"]
         start_step = ckp_data.get("step", 0)
     model.to(args.device)

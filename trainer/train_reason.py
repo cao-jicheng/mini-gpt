@@ -108,7 +108,7 @@ if __name__ == "__main__":
         use_moe=args.use_moe
     ))
     get_model_params(model, model.config)
-    ckp_data = lm_checkpoint(model.config) if args.from_resume else None
+    ckp_data = lm_checkpoint(model.config, prefix="reason", device=args.device) if args.from_resume else None
     if not ckp_data:
         model.load_state_dict(torch.load(args.from_weight, map_location=args.device)["model"], strict=False)
         Logger(f"Load model weights from {args.from_weight}")
@@ -131,6 +131,11 @@ if __name__ == "__main__":
         model.load_state_dict(ckp_data["model"])
         scaler.load_state_dict(ckp_data["scaler"])
         optimizer.load_state_dict(ckp_data["optimizer"])
+        # 需要手动切换optimizer中tensor的训练设备
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if torch.is_tensor(v):
+                    state[k] = v.to(args.device)
         start_epoch = ckp_data["epoch"]
         start_step = ckp_data.get("step", 0)
     model.to(args.device)

@@ -200,7 +200,7 @@ if __name__ == "__main__":
         use_moe=args.use_moe
     ))
     get_model_params(model, model.config)
-    ckp_data = lm_checkpoint(model.config) if args.from_resume else None
+    ckp_data = lm_checkpoint(model.config, prefix="grpo", device=args.device) if args.from_resume else None
     if not ckp_data:
         model.load_state_dict(torch.load(args.from_weight, map_location=args.device)["model"], strict=False)
         Logger(f"Load model weights from {args.from_weight}")
@@ -229,8 +229,13 @@ if __name__ == "__main__":
     start_epoch, start_step = 0, 0
     if args.from_resume and ckp_data:
         model.load_state_dict(ckp_data["model"])
+        scheduler.load_state_dict(ckp_data["scheduler"]) 
         optimizer.load_state_dict(ckp_data["optimizer"])
-        scheduler.load_state_dict(ckp_data['scheduler']) 
+        # 需要手动切换optimizer中tensor的训练设备
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if torch.is_tensor(v):
+                    state[k] = v.to(args.device)
         start_epoch = ckp_data["epoch"]
         start_step = ckp_data.get("step", 0)
     model.to(args.device)

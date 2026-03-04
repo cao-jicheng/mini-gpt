@@ -43,9 +43,11 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             current_logits_loss = current_loss - current_aux_loss
             current_lr = optimizer.param_groups[-1]["lr"]
             eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
-            Logger(f"Epoch [{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, eta_time: {eta_min:.1f} min")
+            Logger(f"Epoch [{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, "
+                   f"aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, eta_time: {eta_min:.1f} min")
             if wandb: 
-                wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "eta_time (minutes)": eta_min})
+                wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss,
+                    "learning_rate": current_lr, "eta_time (minutes)": eta_min})
 
         if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
             model.eval()
@@ -57,12 +59,12 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniGPT Pretraining")
     parser.add_argument("--data_path", type=str, default="../dataset/pretrain_hq.jsonl", help="预训练数据集")
-    parser.add_argument("--from_resume", action="store_true", default=False, help="是否从检查点续训")
+    parser.add_argument("--from_resume", action="store_true", default=False, help="是否从检查点续训（默认不启用）")
     parser.add_argument("--hidden_size", type=int, default=768, help="隐藏层维度")
     parser.add_argument("--num_hidden_layers", type=int, default=16, help="隐藏层数量")
     parser.add_argument("--max_seq_len", type=int, default=340, help="训练的最大截断长度（中文1token≈1.5~1.7字符）")
-    parser.add_argument("--use_moe", type=int, choices=[0, 1], default=0, help="是否使用MoE架构（0=否，1=是）")
-    parser.add_argument("--epochs", type=int, default=1, help="训练轮数（建议1轮zero或2-6轮充分训练）")
+    parser.add_argument("--use_moe", action="store_true", default=False, help="是否使用MoE架构（默认不使用）")
+    parser.add_argument("--epochs", type=int, default=1, help="训练轮数")
     parser.add_argument("--batch_size", type=int, default=64, help="每批次训练样本数量")
     parser.add_argument("--learning_rate", type=float, default=5e-4, help="初始学习率")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
@@ -72,7 +74,7 @@ if __name__ == "__main__":
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
     parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔")
-    parser.add_argument("--use_wandb", action="store_true", default=True, help="是否使用wandb")
+    parser.add_argument("--use_wandb", action="store_true", default=True, help="是否使用wandb（默认使用）")
     parser.add_argument("--wandb_project", type=str, default="MiniGPT", help="wandb项目名")
     args = parser.parse_args()
 
@@ -82,8 +84,11 @@ if __name__ == "__main__":
     setup_seed(42 + (torch.distributed.get_rank() if torch.distributed.is_initialized() else 0))
     
     # ========== 2. 定义模型 ==========
-    model = MiniGPTForCausalLM(MiniGPTConfig(hidden_size=args.hidden_size, 
-        num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe)))
+    model = MiniGPTForCausalLM(MiniGPTConfig(
+        hidden_size=args.hidden_size, 
+        num_hidden_layers=args.num_hidden_layers, 
+        use_moe=args.use_moe
+    ))
     get_model_params(model, model.config)
 
     # ========== 3. 设置混合精度 ==========
@@ -101,7 +106,7 @@ if __name__ == "__main__":
     # ========== 5. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0
     ckp_data = lm_checkpoint(model.config) if args.from_resume else None
-    if ckp_data:
+    if args.from_resume and ckp_data:
         model.load_state_dict(ckp_data["model"])
         scaler.load_state_dict(ckp_data["scaler"])
         optimizer.load_state_dict(ckp_data["optimizer"])
@@ -132,7 +137,7 @@ if __name__ == "__main__":
         batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
         loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
         if skip > 0:
-            Logger(f"Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始")
+            Logger(f"Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step, 从step {start_step + 1}开始")
             train_epoch(epoch, loader, len(loader) + skip, start_step, wandb)
         else:
             train_epoch(epoch, loader, len(loader), 0, wandb)

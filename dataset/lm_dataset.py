@@ -19,12 +19,14 @@ def pre_processing_chat(conversations, add_system_ratio=0.2):
         "You are a knowledgeable AI. Try your best to provide accurate information.",
         "You are minigpt, a small but useful language model."
     ]
+    # 第一条对话的role不为system，需要按照一定的概率从SYSTEM_PROMPTS随机挑选一条，作为系统提示词
     if conversations and conversations[0].get("role") != "system":
         if random.random() < add_system_ratio:
             return [{"role": "system", "content": random.choice(SYSTEM_PROMPTS)}] + conversations
     return conversations
 
 def post_processing_chat(prompt_content, empty_think_ratio=0.05):
+    # 按照一定概率移除文本中的 “<think>\n\n</think>\n\n” 标识符
     if "<think>\n\n</think>\n\n" in prompt_content and random.random() > empty_think_ratio:
         prompt_content = prompt_content.replace("<think>\n\n</think>\n\n", '')
     return prompt_content
@@ -39,6 +41,8 @@ class PretrainDataset(Dataset):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
+        # 使用Hugging Face的datasets库加载本地JSONL文件
+        # 此时数据被加载为内存映射对象，self.samples[index] 会返回一个字典
         self.samples = load_dataset("json", data_files=data_path, split="train")
 
     def __len__(self):
@@ -46,11 +50,19 @@ class PretrainDataset(Dataset):
 
     def __getitem__(self, index):
         sample = self.samples[index]
+        # 根据索引从数据集提取出 "text" 字段的内容
+        # 将文本转为数字ID，预留2个位置给 BOS 和 EOS
+        # truncation=True 保证长度不超过 max_length - 2
         tokens = self.tokenizer(str(sample["text"]), add_special_tokens=False, max_length=self.max_length - 2, truncation=True).input_ids
+        # 在文本前后分别加上“开始符”(BOS)和“结束符”(EOS)
         tokens = [self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id]
+        # 如果长度不足max_length，在后面补齐pad_token_id，最终得到一个长度固定为max_length的列表
         input_ids = tokens + [self.tokenizer.pad_token_id] * (self.max_length - len(tokens))
+        # 将Python列表转为PyTorch的长整型张量
         input_ids = torch.tensor(input_ids, dtype=torch.long)
+        # 克隆一份input_ids作为训练的目标（预测下一个词）
         labels = input_ids.clone()
+        # 将所有Padding部分的标签设为 -100，在计算CrossEntropyLoss时，将忽略这些位置，不计算Loss
         labels[input_ids == self.tokenizer.pad_token_id] = -100
         return input_ids, labels
 
@@ -70,7 +82,16 @@ class SFTDataset(Dataset):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
+        # 使用Hugging Face的load_dataset加载JSONL。
+        # 它的优势是Lazy Loading（懒加载）和Memory Mapping（内存映射）。
+        # 即便jsonl文件有几GB，也不会一次性读入内存，而是用到哪条读哪条。        
         self.samples = load_dataset("json", data_files=jsonl_path, split="train")
+        # 为了实现“只对Assistant的回复计算Loss”，我们需要在长文本中找到回复的起始和结束位置。
+        # 这里预先计算好“Assistant起始符”和“结束符”对应的Token ID序列。
+        # 注意：add_special_tokens=False 很重要，因为我们不想要BOS/EOS再次包裹这些片段。
+        # 假设模板是ChatML，这里硬编码了 'assistant\n'。
+        # 风险提示：如果你的Chat Template渲染出来是 '<|im_start|>assistant' (没换行)，
+        # 这里的匹配逻辑就会失效，导致Loss全为 0。
         self.bos_id = tokenizer(f"{tokenizer.bos_token}assistant\n", add_special_tokens=False).input_ids
         self.eos_id = tokenizer(f"{tokenizer.eos_token}\n", add_special_tokens=False).input_ids
 
@@ -79,45 +100,79 @@ class SFTDataset(Dataset):
 
     def create_chat_prompt(self, conversations):
         messages = conversations.copy()
+        # 兼容简单的工具调用（如果有function call）
         tools = conversations[0]["functions"] if (conversations and conversations[0]["role"] == "system" and conversations[0].get("functions")) else None
+        # 使用Tokenizer自带的apply_chat_template进行渲染
         return self.tokenizer.apply_chat_template(
             messages,
+            # 关键：这里只拼成字符串，先不转ID，方便后续统一截断和处理
             tokenize=False,
+            # SFT是训练已有对话，不需要像推理时那样自动添加 "assistant:" 引导头
             add_generation_prompt=False,
             tools=tools
         )
 
     def generate_labels(self, input_ids):
+        """Loss Masking / Label Masking
+        这是SFT代码的灵魂，生成与input_ids等长的labels序列。
+        规则：
+        - User 的话 -> 设为 -100 (PyTorch CrossEntropyLoss 默认忽略 -100)
+        - Assistant 的话 -> 设为原本的Token ID (参与计算梯度)
+        - Padding -> 设为 -100
+        """
+        # 先初始化全为 -100
         labels = [-100] * len(input_ids)
         i = 0
+        # 线性扫描input_ids，寻找Assistant的回复区间
         while i < len(input_ids):
+            # 判断当前位置是否匹配“Assistant起始符”：<|im_start|>assistant\n
             if input_ids[i:i + len(self.bos_id)] == self.bos_id:
                 start = i + len(self.bos_id)
                 end = start
+                # 继续向后找，直到找到“结束符”：<|im_end|>\n
                 while end < len(input_ids):
                     if input_ids[end:end + len(self.eos_id)] == self.eos_id:
                         break
                     end += 1
+                # 将start到end之间的部分（即回复内容）从 -100 恢复为真实的input_ids
+                # 只有这一部分会产生梯度，更新模型参数
+                # min(..., self.max_length) 是防止越界                
                 for j in range(start, min(end + len(self.eos_id), self.max_length)):
                     labels[j] = input_ids[j]
+                # 移动指针i到当前回复结束的位置，继续找下一轮（多轮对话场景）
                 i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
             else:
+                # 如果没匹配到，指针后移一位
                 i += 1
         return labels
 
     def __getitem__(self, index):
         sample = self.samples[index]
+        # 提示词前处理：按概率增加system部分
         conversations = pre_processing_chat(sample["conversations"])
+        # 将prompt由字典形式转换为长字符串形式
         prompt = self.create_chat_prompt(conversations)
+        # 提示词后处理：按概率移除<think>标识符（训练推理模型时需要）
         prompt = post_processing_chat(prompt)
+        # 转换为Token IDs，并截断多余的部分
         input_ids = self.tokenizer(prompt).input_ids[:self.max_length]
+        # 如果长度不够max_length，用pad_token_id补齐
+        # 这样做是为了让一个Batch内的数据维度一致，才能堆叠成Tensor
         input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
+        # 生成Mask后的标签
         labels = self.generate_labels(input_ids)
+
+        # # ===== 调试代码 (强烈建议在正式训练前取消注释跑一次) =====
+        # # 作用：人工肉眼检查Mask是否正确，也就是User部分对应的Label是否是-100。
+        # print(f"\n----- Sample {index} -----")
+        # for i, (x, y) in enumerate(zip(input_ids[:-1], labels[1:])):
+        #     print(f"{i:3d}: X={self.tokenizer.decode([x])!r:16s} ---> Y={self.tokenizer.decode([input_ids[i+1]])!r:16s} label={y}")
+        # # =====================================================        
         return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
 
 class DPODataset(Dataset):
     """RLHF强化学习数据集
-    数据格式：
+    数据格式：                                                                     
     {"chosen": [
         {"role": "user", "content": "Find the size of angle x in the figure."}, 
         {"role": "assistant", "content": "To determine the size of angle x in the provided figure..."}],
@@ -130,6 +185,7 @@ class DPODataset(Dataset):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
+        # 获取padding token的id，如果没有则默认为 0
         self.padding = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
         self.bos_id = tokenizer(f"{tokenizer.bos_token}assistant\n", add_special_tokens=False).input_ids
         self.eos_id = tokenizer(f"{tokenizer.eos_token}\n", add_special_tokens=False).input_ids
@@ -140,26 +196,31 @@ class DPODataset(Dataset):
 
     def __getitem__(self, index):
         sample = self.samples[index]
+        # 获取chosen (好回答)的对话列表
         chosen = sample["chosen"]
-        rejected = sample["rejected"]
         chosen_prompt = self.tokenizer.apply_chat_template(
             chosen, tokenize=False, add_generation_prompt=False
         )
         chosen_prompt = post_processing_chat(chosen_prompt)
+        chosen_encoding = self.tokenizer(
+            chosen_prompt, truncation=True, max_length=self.max_length, padding="max_length"
+        )
+        chosen_input_ids = chosen_encoding["input_ids"]
+        chosen_loss_mask = self.generate_loss_mask(chosen_input_ids)
+        # 获取rejected (坏回答) 的对话列表
+        rejected = sample["rejected"]
         rejected_prompt = self.tokenizer.apply_chat_template(
             rejected, tokenize=False, add_generation_prompt=False
         )
         rejected_prompt = post_processing_chat(rejected_prompt)
-        chosen_encoding = self.tokenizer(
-            chosen_prompt, truncation=True, max_length=self.max_length, padding="max_length"
-        )
         rejected_encoding = self.tokenizer(
             rejected_prompt, truncation=True, max_length=self.max_length, padding="max_length"
         )
-        chosen_input_ids = chosen_encoding["input_ids"]
-        chosen_loss_mask = self.generate_loss_mask(chosen_input_ids)
         rejected_input_ids = rejected_encoding["input_ids"]
         rejected_loss_mask = self.generate_loss_mask(rejected_input_ids)
+        # 构造训练数据 (Shift Trick)
+        # 在因果语言模型（Causal LM）训练中，我们预测下一个token。
+        # 输入是x (0 到 N-1)，目标是y (1 到 N)，掩模mask和目标y是对应的
         x_chosen = torch.tensor(chosen_input_ids[:-1], dtype=torch.long)
         y_chosen = torch.tensor(chosen_input_ids[1:], dtype=torch.long)
         mask_chosen = torch.tensor(chosen_loss_mask[1:], dtype=torch.long)
@@ -176,16 +237,21 @@ class DPODataset(Dataset):
         }
 
     def generate_loss_mask(self, input_ids):
+        # 初始化全 0 的mask
         loss_mask = [0] * len(input_ids)
         i = 0
+        # 遍历整个token序列
         while i < len(input_ids):
+            # 寻找Assistant回答的“开始标记” (例如 "<|im_start|>assistant\n")
             if input_ids[i:i + len(self.bos_id)] == self.bos_id:
                 start = i + len(self.bos_id)
                 end = start
+                # 寻找Assistant回答的“结束标记” (例如 "<|im_end|>\n")
                 while end < len(input_ids):
                     if input_ids[end:end + len(self.eos_id)] == self.eos_id:
                         break
                     end += 1
+                # 将Start到End之间的部分mask设为 1，这部分就是模型实际生成的回答，我们需要计算它的Loss
                 for j in range(start, min(end + len(self.eos_id), self.max_length)):
                     loss_mask[j] = 1
                 i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
@@ -238,3 +304,10 @@ class RLAIFDataset(Dataset):
             "prompt": prompt,
             "answer": answer
         }
+
+
+if __name__ == "__main__":
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained("../model")
+    train_ds = SFTDataset("sft_mini_512.jsonl", tokenizer, max_length=340)
+    print(train_ds[0])

@@ -276,6 +276,7 @@ class RLAIFDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.samples = load_dataset("json", data_files=jsonl_path, split="train")
+        # add_special_tokens=False 表示不要自动在首尾添加额外的特殊符
         self.bos_id = tokenizer(f"{tokenizer.bos_token}assistant\n", add_special_tokens=False).input_ids
         self.eos_id = tokenizer(f"{tokenizer.eos_token}\n", add_special_tokens=False).input_ids
 
@@ -283,15 +284,25 @@ class RLAIFDataset(Dataset):
         return len(self.samples)
 
     def create_chat_prompt(self, conversations):
+        # 用于存放标准格式的对话列表 (形如 [{"role": "user", "content": "..."}, ...])
         messages = []
+        # 用于暂存最终的回复内容
         answer = ''
         for i, turn in enumerate(conversations):
+            # 根据索引的奇偶性判断角色，偶数轮(0, 2, 4...)是user，奇数轮(1, 3, 5...)是assistant
+            # 这种写法强制假设对话是user和assistant严格交替进行的
             role = "user" if i % 2 == 0 else "assistant"
+            # 按照HuggingFace chat_template要求的格式拼接字典，并加入messages列表
             messages.append({"role": role, "content": turn["content"]})
+            # 不断覆盖answer，当循环结束时，answer保存的就是对话列表中的最后一句话
             answer = turn["content"]
+        # 使用tokenizer的chat template功能将历史对话格式化为单个字符串
         prompt = self.tokenizer.apply_chat_template(
+            # 取除了最后一句话之外的所有对话（即历史上下文作为Prompt）
             messages[:-1],
+            # 返回字符串，而不是token IDs，在后面训练阶段，做了padding后再tokenize
             tokenize=False,
+            # 在字符串末尾自动加上让模型开始生成的引导符（如 "<|im_start|>assistant\n"）
             add_generation_prompt=True
         )
         prompt = post_processing_chat(prompt)
